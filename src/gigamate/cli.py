@@ -12,6 +12,7 @@ Usage:
     gigamate profile [name]                    Show/set power profile
     gigamate profile contribute                Pull Request instructions
     gigamate detect [--acpi]                   Detect hardware
+    gigamate doctor                            Diagnose hardware and permissions
     gigamate calibrate [rgb|acpi|all]        Run calibration
     gigamate version                           Show version
     gigamate update [--check] [--yes]          Check for / install updates
@@ -60,6 +61,7 @@ from .acpi import (
     AcpiController,
     FanProfile,
     FanState,
+    acpi_module_status,
     probe_acpi_capabilities,
     AcpiCapabilities,
 )
@@ -210,6 +212,15 @@ def cmd_rgb_cycle(args) -> None:
         print("\nStopped.")
 
 
+def _explain_hidraw_access(path: str, label: str = "hidraw device") -> None:
+    """Print actionable guidance when a hidraw node cannot be opened."""
+    from .doctor import permission_lines
+
+    print(f"Cannot access {label} {path}: permission denied", file=sys.stderr)
+    for line in permission_lines(path):
+        print(f"  {line}" if line else "", file=sys.stderr)
+
+
 def cmd_rgb_calibrate(args) -> None:
     """Interactive keyboard RGB calibration."""
     if args.vid and args.pid:
@@ -227,7 +238,11 @@ def cmd_rgb_calibrate(args) -> None:
         try:
             count = LampArrayDevice(lamp[0]).lamp_count()
         except (OSError, ValueError) as exc:
-            print(f"Cannot access LampArray keyboard {lamp[0]}: {exc}", file=sys.stderr)
+            if isinstance(exc, PermissionError):
+                _explain_hidraw_access(lamp[0], "LampArray keyboard")
+            else:
+                print(f"Cannot access LampArray keyboard {lamp[0]}: {exc}",
+                      file=sys.stderr)
             sys.exit(1)
         # LampArray uses direct RGB; the older byte-by-byte calibration is unnecessary.
         profile = make_profile(vid, pid, lamp[1])
@@ -858,9 +873,11 @@ def cmd_profile_report(args) -> None:
         print(f"  ACPI backend:       {caps.backend}")
         print(f"  Sensors:            temp={caps.has_temperature} fan_rpm={caps.has_fan_rpm} "
               f"fan_duty={caps.has_fan_duty} fans={caps.fan_count}")
-        print(f"  Interface answers profile writes: {caps.has_power_profiles}")
+        print(f"  Profile interface present: {caps.has_power_profiles}")
     else:
+        status = acpi_module_status()
         print("  ACPI backend:       none")
+        print(f"  ACPI module:        {status.summary}")
     if match is None:
         print("  Model profile:      none")
     else:
@@ -1031,15 +1048,14 @@ def cmd_detect_acpi(args) -> None:
 def _print_acpi_caps(caps: AcpiCapabilities) -> None:
     """Print ACPI capabilities in a human-readable format."""
     if caps.backend == "none":
+        status = acpi_module_status()
         print("  No ACPI interface detected.")
+        print(f"  Running kernel: {status.running_kernel}")
+        print(f"  Module:         {status.summary}")
+        print(f"  {status.hint}")
         print()
-        print("  To enable ACPI features:")
-        print("    1. Install kernel headers and re-run install.sh")
-        print("       (builds and loads the bundled gigamate_acpi module, no extra packages)")
-        print("    2. If you already have the acpi_call module installed,")
-        print("       it is used automatically as a fallback.")
-        print("    3. If the module exists but is missing for the running kernel,")
-        print("       run 'gigamate repair' to rebuild and reload it.")
+        print("  ACPI features use the bundled gigamate_acpi module.")
+        print("  If the acpi_call module is already installed, it is used as a fallback.")
         return
 
     backend_name = {"module": "kernel module", "acpi_call": "acpi_call", "mock": "mock"}.get(
@@ -1153,13 +1169,21 @@ def cmd_hotkeys_watch(args) -> None:
     print("  Press the buttons whose signatures you want to capture.", flush=True)
 
     fds = {}
+    open_errors = {}
     for iface, path in nodes:
         try:
             fds[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = iface
         except OSError as exc:
             print(f"  Cannot open {path}: {exc}")
+            open_errors[path] = exc
     if not fds:
-        print("Could not open any hidraw interface (check udev permissions).")
+        print("Could not open any hidraw interface.")
+        for path, exc in open_errors.items():
+            if isinstance(exc, PermissionError):
+                _explain_hidraw_access(path, "keyboard hidraw interface")
+                break
+        else:
+            print("Check that the keyboard is connected.")
         sys.exit(1)
 
     last = {}
@@ -1212,6 +1236,7 @@ _ACPI_PROFILE_TEMPLATES = {
     "AERO": {0: "Quiet", 1: "Balanced", 2: "Performance", 3: "Gaming"},
     "AORUS": {0: "Quiet", 1: "Balanced", 2: "Performance", 3: "Gaming"},
     "GIGABYTE AERO": {0: "Quiet", 1: "Balanced", 2: "Performance", 3: "Gaming"},
+    "GIGABYTE EAGLE": {0: "Quiet", 1: "Balanced", 2: "Performance", 3: "Gaming"},
     "GIGABYTE GAMING": {0: "eco", 1: "balanced", 2: "boost"},
 }
 
@@ -1251,7 +1276,7 @@ def cmd_calibrate_acpi(args) -> None:
         if profile is None:
             profile = DeviceProfile(
                 vid=vid, pid=pid, name=dmi_model or f"{vid:04X}:{pid:04X}",
-                interfaces=[], control_interface=0,
+                version=3, interfaces=[], control_interface=0,
             )
             print(f"Creating a new ACPI-only profile for: {profile.name}")
         else:
@@ -1262,7 +1287,8 @@ def cmd_calibrate_acpi(args) -> None:
         profile = match_dmi_profile(load_user_dmi_profiles())
         if profile is None:
             profile = DeviceProfile(
-                vid=0, pid=0, name=dmi_model, interfaces=[], control_interface=0,
+                vid=0, pid=0, name=dmi_model, version=3,
+                interfaces=[], control_interface=0,
                 dmi=DmiConfig(product_names=[dmi_model]),
             )
             print(f"Creating a new DMI-keyed profile for: {profile.name}")
@@ -1308,6 +1334,19 @@ def cmd_calibrate_acpi(args) -> None:
         print("known for this model family, so power-profile switching stays DISABLED.")
         print()
 
+    # A newly generated profile is unverified by definition. Re-running
+    # calibration on an existing profile that already declares working
+    # profiles must not downgrade a verified model.
+    existing_acpi = profile.acpi
+    if (
+        existing_acpi is not None
+        and existing_acpi.has_power_profiles
+        and existing_acpi.profiles
+    ):
+        confidence = existing_acpi.confidence
+    else:
+        confidence = "experimental"
+
     profile.acpi = AcpiConfig(
         has_fan_control=caps.has_fan_rpm or caps.has_fan_duty,
         has_temperature=caps.has_temperature,
@@ -1317,6 +1356,7 @@ def cmd_calibrate_acpi(args) -> None:
         sensor_labels=sensor_labels,
         profiles=profiles_map,
         backend=caps.backend,
+        confidence=confidence,
     )
 
     path = save_user_profile(profile)
@@ -1342,6 +1382,13 @@ def cmd_version(args) -> None:
     print(f"GigaMate v{__version__}")
     print("Gigabyte laptop management for Linux")
     print()
+
+
+def cmd_doctor(args) -> None:
+    """Diagnose hardware and keyboard permissions."""
+    from .doctor import run_doctor
+
+    sys.exit(run_doctor())
 
 
 def cmd_repair(args) -> None:
@@ -1727,6 +1774,7 @@ def _subcommand_main() -> None:
   gigamate status                    Show hardware status
   gigamate profile gaming            Set Gaming power profile
   gigamate detect                    Detect hardware
+  gigamate doctor                    Diagnose hardware and permissions
   gigamate calibrate rgb             Interactive RGB calibration
         
 Legacy: gigabyte-rgb <effect> <colour>  (still works)""",
@@ -1826,6 +1874,9 @@ Legacy: gigabyte-rgb <effect> <colour>  (still works)""",
     calibrate_all_parser.add_argument("--pid", type=lambda x: int(x, 16), default=None)
     calibrate_all_parser.add_argument("--interface", "-i", type=int, default=None,
                                       help="USB RGB control interface (default: auto-detect)")
+
+    # --- doctor subcommand ---
+    sub.add_parser("doctor", help="Diagnose hardware and permissions")
 
     # --- version subcommand ---
     sub.add_parser("version", help="Show version")
@@ -1932,6 +1983,8 @@ Legacy: gigabyte-rgb <effect> <colour>  (still works)""",
         _dispatch_calibrate(args)
     elif args.command == "version":
         cmd_version(args)
+    elif args.command == "doctor":
+        cmd_doctor(args)
     elif args.command == "repair":
         cmd_repair(args)
     elif args.command == "update":
